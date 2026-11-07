@@ -1,0 +1,29 @@
+<?xml version="1.0"?>
+<robot name="limo_four_diff" xmlns:xacro="http://www.ros.org/wiki/xacro">
+    <xacro:include filename="$(find limo_car)/gazebo/four_diff.xacro" />
+    <xacro:limo_four_diff />
+    <xacro:include filename="$(find limo_car)/gazebo/sensor.xacro" />
+
+    <!-- Sensor poses: ROS1 limo_description/urdf/limo_four_diff.xacro.
+         These are simulation base_link offsets, not the real-robot static TF. -->
+    <xacro:gazebo_laser frame_prefix="laser" />
+    <joint name="laser_joint" type="fixed">
+        <origin xyz="0.103 0 -0.034" rpy="0 0 0"/>
+        <parent link="base_link"/>
+        <child link="laser_link"/>
+    </joint>
+
+    <xacro:gazebo_depth_camera frame_prefix="depth_camera" />
+    <joint name="depth_camera_joint" type="fixed">
+        <origin xyz="0.084 0 0.03" rpy="0 0 0"/>
+        <parent link="base_link"/>
+        <child link="depth_camera_link"/>
+    </joint>
+
+    <xacro:gazebo_imu frame_prefix="imu" />
+    <joint name="imu_joint" type="fixed">
+        <origin xyz="0.0 0 -0.1" rpy="0 0 0"/>
+        <parent link="base_link"/>
+        <child link="imu_link"/>
+    </joint>
+</robot>

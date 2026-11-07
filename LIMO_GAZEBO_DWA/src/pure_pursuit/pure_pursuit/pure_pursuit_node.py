@@ -1,0 +1,940 @@
+#!/usr/bin/env python3
+"""
+Pure Pursuit Controller for F1TENTH Autonomous Racing
+
+This module implements a pure pursuit path following algorithm for autonomous
+vehicle navigation in F1TENTH racing scenarios. The controller tracks a
+predefined path while maintaining smooth steering and velocity control.
+"""
+
+import rclpy
+from rclpy.node import Node
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+from nav_msgs.msg import Odometry, Path
+from geometry_msgs.msg import PoseStamped, Point
+from std_msgs.msg import String, Bool
+import math
+import csv
+import os
+from ackermann_msgs.msg import AckermannDriveStamped
+from visualization_msgs.msg import Marker
+from sensor_msgs.msg import Joy
+import numpy as np
+from tf2_ros import Buffer, TransformListener
+from std_msgs.msg import Float64
+import time
+
+def euler_from_quaternion(quaternion):
+    """
+    Convert quaternion to Euler angles.
+
+    Converts quaternion (w in last place) to euler roll, pitch, yaw.
+    This should be replaced when porting for ROS 2 Python tf_conversions is done.
+
+    Args:
+        quaternion (list): Quaternion as [x, y, z, w]
+
+    Returns:
+        tuple: (roll, pitch, yaw) in radians
+    """
+    x = quaternion[0]
+    y = quaternion[1]
+    z = quaternion[2]
+    w = quaternion[3]
+
+    sinr_cosp = 2 * (w * x + y * z)
+    cosr_cosp = 1 - 2 * (x * x + y * y)
+    roll = np.arctan2(sinr_cosp, cosr_cosp)
+
+    sinp = 2 * (w * y - z * x)
+    pitch = np.arcsin(sinp)
+
+    siny_cosp = 2 * (w * z + x * y)
+    cosy_cosp = 1 - 2 * (y * y + z * z)
+    yaw = np.arctan2(siny_cosp, cosy_cosp)
+
+    return roll, pitch, yaw
+
+
+class PurePursuit(Node):
+    """
+    Pure Pursuit Path Following Controller for F1TENTH Racing.
+
+    This class implements a pure pursuit algorithm for autonomous vehicle navigation.
+    It subscribes to odometry data and publishes Ackermann drive commands to follow
+    a predefined path. The controller supports both CSV-based racing paths.
+
+    Key Features:
+        - Adaptive lookahead distance based on vehicle velocity
+        - PID-based steering control with configurable gains
+        - Sigmoid-based velocity control for smooth cornering
+        - Support for both racing and solo driving modes
+        - Real-time path switching capability
+        - Joystick control for parameter tuning
+        - Visualization markers for debugging
+
+    Attributes:
+        path (list): Current path as list of (x, y, velocity) tuples
+        lookahead_distance (float): Current lookahead distance in meters
+        is_active (bool): Controller activation state
+        stop (bool): Emergency stop flag
+    """
+
+    def __init__(self):
+        """
+        Initialize the Pure Pursuit controller node.
+
+        Sets up all ROS2 parameters, subscribers, publishers, and loads the initial path.
+        """
+        super().__init__("pure_pursuit_node")
+
+        # Declare all parameters with default values
+        self.declare_parameter("max_lookahead_distance", 1.0)
+        self.declare_parameter("min_lookahead_distance", 1.0)
+        self.declare_parameter("cmd_vel_topic", "/ackermann_cmd")
+        self.declare_parameter("odometry_topic", "/odom")
+        self.declare_parameter("fused_odometry_topic", "/fused_odometry")
+        self.declare_parameter("path_topic", "/path")
+        self.declare_parameter("kp", 0.0)
+        self.declare_parameter("kd", 0.0)
+        self.declare_parameter("k_sigmoid", 8.0)
+        self.declare_parameter("skidding_velocity_thresh", 0.0)
+        self.declare_parameter("joy_topic", "/joy")
+        self.declare_parameter("pause_topic", "/control_selector")
+        self.declare_parameter("control_frequency", 200.0)
+        self.declare_parameter("tf_timeout", 0.5)
+        self.declare_parameter("marker_resolution", 60)
+        self.declare_parameter("subscriber_queue_size", 10)
+        self.declare_parameter("publisher_queue_size", 10)
+        self.declare_parameter("tf_target", "map")
+        self.declare_parameter("tf_source", "base_link")
+        self.declare_parameter("laser_base_link_length", 0.35)
+        self.declare_parameter("enable_speed_capping", True)
+        self.declare_parameter("speed_capping_topic", "/speed_cap")
+        self.declare_parameter("inverse", False)
+        self.declare_parameter("use_fused_odometry", True)
+        self.declare_parameter("use_lateral_error_gamma_compensation", True)
+        self.declare_parameter("lateral_error_compensation_gain", 0.1)
+        self.declare_parameter("use_lateral_error_speed_reducer", True)
+        self.declare_parameter("lateral_error_speed_reducer_gain", 0.1)
+        self.declare_parameter("use_lateral_deviation_based_lookahead", False)
+        self.declare_parameter("lookahead_velocity_weight", 0.5)
+        self.declare_parameter("lookahead_lateral_deviation_weight", 0.5)
+        self.declare_parameter("max_lateral_deviation", 1.0)
+        # Load parameters
+        self.kp = self.get_parameter("kp").get_parameter_value().double_value
+        self.kd = self.get_parameter("kd").get_parameter_value().double_value
+        self.min_lad = (
+            self.get_parameter("min_lookahead_distance")
+            .get_parameter_value()
+            .double_value
+        )
+        self.max_lad = (
+            self.get_parameter("max_lookahead_distance")
+            .get_parameter_value()
+            .double_value
+        )
+        self.cmd_vel_topic = (
+            self.get_parameter("cmd_vel_topic").get_parameter_value().string_value
+        )
+        self.odom_topic = (
+            self.get_parameter("odometry_topic").get_parameter_value().string_value
+        )
+        self.fused_odom_topic = (
+            self.get_parameter("fused_odometry_topic")
+            .get_parameter_value()
+            .string_value
+        )
+        self.use_fused_odometry = (
+            self.get_parameter("use_fused_odometry").get_parameter_value().bool_value
+        )
+        self.use_lateral_error_gamma_compensation = (
+            self.get_parameter("use_lateral_error_gamma_compensation").get_parameter_value().bool_value
+        )
+        self.lateral_error_compensation_gain = (
+            self.get_parameter("lateral_error_compensation_gain").get_parameter_value().double_value
+        )
+        self.use_lateral_error_speed_reducer = (
+            self.get_parameter("use_lateral_error_speed_reducer").get_parameter_value().bool_value
+        )
+        self.lateral_error_speed_reducer_gain = (
+            self.get_parameter("lateral_error_speed_reducer_gain").get_parameter_value().double_value
+        )
+        self.lookahead_velocity_weight = (
+            self.get_parameter("lookahead_velocity_weight").get_parameter_value().double_value
+        )
+        self.lookahead_lateral_deviation_weight = (
+            self.get_parameter("lookahead_lateral_deviation_weight").get_parameter_value().double_value
+        )
+        self.max_lateral_deviation = (
+            self.get_parameter("max_lateral_deviation").get_parameter_value().double_value
+        )
+        self.use_lateral_deviation_based_lookahead = (
+            self.get_parameter("use_lateral_deviation_based_lookahead").get_parameter_value().bool_value
+        )
+        self.path_topic = (
+            self.get_parameter("path_topic").get_parameter_value().string_value
+        )
+        self.k_sigmoid = (
+            self.get_parameter("k_sigmoid").get_parameter_value().double_value
+        )
+        self.skidding_velocity_thresh = (
+            self.get_parameter("skidding_velocity_thresh")
+            .get_parameter_value()
+            .double_value
+        )
+        self.joy_topic = (
+            self.get_parameter("joy_topic").get_parameter_value().string_value
+        )
+        self.pause_topic = (
+            self.get_parameter("pause_topic").get_parameter_value().string_value
+        )
+        self.control_frequency = (
+            self.get_parameter("control_frequency").get_parameter_value().double_value
+        )
+        self.tf_timeout = (
+            self.get_parameter("tf_timeout").get_parameter_value().double_value
+        )
+        self.marker_resolution = int(
+            self.get_parameter("marker_resolution").get_parameter_value().integer_value
+        )
+        self.queue_size = int(
+            self.get_parameter("subscriber_queue_size")
+            .get_parameter_value()
+            .integer_value
+        )
+        self.pub_queue_size = int(
+            self.get_parameter("publisher_queue_size")
+            .get_parameter_value()
+            .integer_value
+        )
+        self.tf_target = (
+            self.get_parameter("tf_target").get_parameter_value().string_value
+        )
+        self.tf_source = (
+            self.get_parameter("tf_source").get_parameter_value().string_value
+        )
+        self.laser_base_link_length = (
+            self.get_parameter("laser_base_link_length").get_parameter_value().double_value
+        )
+        self.speed_capping_enabled = (
+            self.get_parameter("enable_speed_capping").get_parameter_value().bool_value
+        )
+        self.speed_capping_topic = (
+            self.get_parameter("speed_capping_topic").get_parameter_value().string_value
+        )
+        self.target_velocity = -1.0
+        self.inverse = self.get_parameter("inverse").get_parameter_value().bool_value
+        self.control_selector_topic = (
+            self.get_parameter("pause_topic").get_parameter_value().string_value
+        )
+        if self.use_fused_odometry:
+            qos_profile = QoSProfile(
+                reliability=ReliabilityPolicy.BEST_EFFORT,
+                history=HistoryPolicy.KEEP_LAST,
+                depth=10,
+            )
+            self.fused_odom_sub = self.create_subscription(
+                Odometry,
+                self.fused_odom_topic,
+                self.fused_odom_callback,
+                qos_profile
+            )
+            self.fused_odometry = Odometry()
+
+        # Initialize subscribers and publishers
+        self.odom_sub = self.create_subscription(
+            Odometry, self.odom_topic, self.odom_callback, self.queue_size
+        )
+        self.cmd_vel_pub = self.create_publisher(
+            AckermannDriveStamped, self.cmd_vel_topic, self.pub_queue_size
+        )
+        self.path_sub = self.create_subscription(
+            Path, self.path_topic, self.path_update_cb, self.queue_size
+        )
+        self.pause_sub = self.create_subscription(
+            String, self.pause_topic, self.toggle_stop_cb, self.queue_size
+        )
+        self.joy_sub = self.create_subscription(
+            Joy, self.joy_topic, self.joy_callback, self.queue_size
+        )
+        self.control_selector_sub = self.create_subscription(
+            String,
+            self.control_selector_topic,
+            self.control_selector_callback,
+            self.queue_size,
+        )
+        if self.speed_capping_enabled:
+            self.speed_cap_sub = self.create_subscription(
+                Float64,
+                self.speed_capping_topic,
+                self.speed_cap_callback,
+                self.queue_size,
+            )
+        # Initialize TF2 components
+        self.tf_buffer = Buffer()
+        # Separate node and thread: lookup_transform below blocks this executor for tf_timeout on
+        # a miss. /tf delivered on the same executor reached only about one message per miss, so
+        # map->odom (under 3% of /tf) took a long time to arrive and no command was published.
+        # Passing self here would not help: rclpy.spin() moves the node back to its own executor.
+        self.tf_listener = TransformListener(self.tf_buffer, None, spin_thread=True)
+
+        # Create control timer with configurable frequency
+        timer_period = 1.0 / self.control_frequency
+        self.timer = self.create_timer(timer_period, self.get_pose)
+
+        # Initialize path data structures
+        self.csv_race_path = []
+
+        # Control state variables
+        self.activate_autonomous_vel = False
+        self.prev_gamma = 0.0
+        self.lookahead_distance = 0.0
+        self.odometry = Odometry()
+
+        # Set initial path
+        self.path = []
+        self.min_velocity, self.max_velocity = None, None
+        
+        # lookahead 
+        if self.lookahead_velocity_weight + self.lookahead_lateral_deviation_weight != 1.0:
+            raise ValueError("Lookahead velocity and lateral deviation weights must sum to 1.0")
+        
+        # Initialize visualization publishers
+        self.lookahead_marker_pub = self.create_publisher(
+            Marker, "/lookahead_marker", self.pub_queue_size
+        )
+        self.lookahead_circle_pub = self.create_publisher(
+            Marker, "/lookahead_circle", self.pub_queue_size
+        )
+
+        self.get_logger().info("Pure Pursuit Node initialized successfully")
+        self.get_logger().info(f"Control frequency: {self.control_frequency} Hz")
+        self.get_logger().info(f"Use lateral deviation based lookahead: {self.use_lateral_deviation_based_lookahead}")
+        if self.use_lateral_deviation_based_lookahead:
+            self.get_logger().info(f"Lookahead velocity weight: {self.lookahead_velocity_weight}")
+            self.get_logger().info(f"Lookahead lateral deviation weight: {self.lookahead_lateral_deviation_weight}")
+        self.get_logger().info(f"Use lateral error gamma compensation: {self.use_lateral_error_gamma_compensation}")
+        self.get_logger().info(f"Use lateral error speed reducer: {self.use_lateral_error_speed_reducer}")
+        self.get_logger().info(f"Use fused odometry: {self.use_fused_odometry}")
+
+    def control_selector_callback(self, msg: String):
+        """
+        Callback to handle control mode selection.
+
+        Args:
+            msg (String): Message indicating the selected control mode
+        """
+        if "pure_pursuit" in msg.data:
+            self.activate_autonomous_vel = True
+        else:
+            self.activate_autonomous_vel = False
+
+    def speed_cap_callback(self, msg: Float64):
+        """
+        Callback to update the maximum speed cap dynamically.
+
+        Args:
+            msg (Float64): New speed cap
+        """
+        self.target_velocity = msg.data
+        self.get_logger().info(
+            f"Updated speed cap to {self.target_velocity:.2f} m/s",
+            throttle_duration_sec=5.0,
+        )
+
+    def toggle_stop_cb(self, msg: String):
+        """
+        Callback to toggle the emergency stop state.
+
+        Args:
+            msg (String): Message indicating the desired stop state
+        """
+        if msg.data == "pure_pursuit":
+            self.activate_autonomous_vel = True
+        else:
+            self.activate_autonomous_vel = False
+
+    def joy_callback(self, msg: Joy):
+        """
+        Joystick callback for real-time parameter tuning during operation.
+
+        Button mapping:
+        - Y (button 3): Increase kd by 0.1
+        - A (button 1): Decrease kd by 0.1
+        - B (button 2): Increase kp by 0.1
+        - X (button 0): Decrease kp by 0.1
+        - LB (button 4): Enable autonomous velocity control
+
+        Args:
+            msg (Joy): Joystick message containing button and axis states
+        """
+        # Y button - Increase derivative gain
+        if msg.buttons[3] == 1:
+            self.kd += 0.1
+            self.get_logger().info(f"kd increased to {self.kd:.2f}")
+
+        # A button - Decrease derivative gain
+        if msg.buttons[1] == 1:
+            self.kd -= 0.1
+            self.get_logger().info(f"kd decreased to {self.kd:.2f}")
+
+        # B button - Increase proportional gain
+        if msg.buttons[2] == 1:
+            self.kp += 0.1
+            self.get_logger().info(f"kp increased to {self.kp:.2f}")
+
+        # X button - Decrease proportional gain
+        if msg.buttons[0] == 1:
+            self.kp -= 0.1
+            self.get_logger().info(f"kp decreased to {self.kp:.2f}")
+
+    def get_path_velocity_bounds(self):
+        """
+        Get velocity bounds from the current path.
+
+        Path velocities are stored in each path point's third tuple element.
+        Non-positive values are treated as missing velocity data.
+        """
+        velocities = [point[2] for point in self.path if point[2] > 0.0]
+        if not velocities:
+            return 0.0, 0.0
+
+        return min(velocities), max(velocities)
+
+    def path_update_cb(self, msg: Path):
+        """
+        Callback for switching between different path sources.
+
+        Args:
+            msg (String): Path source identifier ("csv_race_path")
+        """
+        self.path = []
+        for pose in msg.poses:
+            x = pose.pose.position.x
+            y = pose.pose.position.y
+            v = pose.pose.orientation.w  # Velocity stored in orientation.w
+            self.path.append((x, y, v))
+
+        if self.inverse:
+            self.path = self.path[::-1]
+            self.get_logger().info("Inverted the path")
+
+        self.min_velocity, self.max_velocity = self.get_path_velocity_bounds()
+        if self.max_velocity <= self.min_velocity:
+            self.get_logger().warn("Path contains no valid velocity data, using default velocity control")
+        elif self.max_velocity <= 0.0 or self.min_velocity <= 0.0:
+            self.get_logger().warn("Path contains no positive velocity data")
+
+    def get_pose(self):
+        """
+        Main control loop that gets robot pose and executes pure pursuit control.
+
+        This method is called at the configured control frequency. It:
+        1. Gets the current robot pose (from fused odometry or TF2)
+        2. Calculates lookahead distance based on current velocity
+        3. Finds the appropriate lookahead point on the path
+        4. Executes pure pursuit control to track that point
+        5. Publishes visualization markers for debugging
+        """
+        try:
+            if self.use_fused_odometry:
+                pose = self.fused_odometry.pose.pose
+                x = pose.position.x
+                y = pose.position.y
+                orientation_list = [
+                    pose.orientation.x,
+                    pose.orientation.y,
+                    pose.orientation.z,
+                    pose.orientation.w,
+                ]
+                _, _, yaw = euler_from_quaternion(orientation_list)
+                velocity = self.fused_odometry.twist.twist.linear.x
+            else:
+                now = rclpy.time.Time()
+                transform = self.tf_buffer.lookup_transform(
+                    self.tf_target,
+                    self.tf_source,
+                    now,
+                    timeout=rclpy.duration.Duration(seconds=self.tf_timeout),
+                )
+
+                trans = transform.transform.translation
+                rot = transform.transform.rotation
+
+                orientation_list = [rot.x, rot.y, rot.z, rot.w]
+                _, _, yaw = euler_from_quaternion(orientation_list)
+
+                x, y = trans.x, trans.y
+                velocity = self.odometry.twist.twist.linear.x
+
+            if self.use_lateral_deviation_based_lookahead:
+                closest_pt = self.find_closest_point_on_path(x, y)
+                bx_e, by_e = self.transform_to_vehicle_frame(closest_pt, x, y, yaw)
+                self.lookahead_distance = self.get_lad_lateral_deviation_velocity(velocity, by_e)
+            else:
+                self.lookahead_distance = self.get_lad_thresh(velocity)
+
+            self.publish_lookahead_circle(x, y)
+
+            x_laser = x + self.laser_base_link_length*np.cos(yaw)
+            y_laser = y + self.laser_base_link_length*np.sin(yaw)
+
+            lookahead_point, closest_point, lookahead_index, closest_point_laser, closest_laser_idx = self.find_lookahead_point(
+                self.lookahead_distance, x, y, yaw, x_laser, y_laser
+            )
+
+            if lookahead_point is None:
+                self.get_logger().warn("No lookahead point found")
+                return
+
+            start_time = time.perf_counter()
+            self.pursuit_the_point(
+                self.lookahead_distance, lookahead_point, lookahead_index, x, y, yaw, x_laser,y_laser, closest_point, closest_point_laser
+            )
+            end_time = time.perf_counter()
+            self.get_logger().debug(f"Control loop execution time: {(end_time - start_time)*1000:.2f} ms")
+
+            self.publish_lookahead_marker(lookahead_point)
+
+        except Exception as e:
+            import traceback; self.get_logger().warn(f"Transform not available: {e}\n{traceback.format_exc()}")
+
+    def find_closest_point_on_path(self, x, y):
+        """
+        Find the closest point on the path to the current vehicle position.
+
+        Args:
+            x (float): Current vehicle x position
+            y (float): Current vehicle y position
+
+        Returns:
+            tuple: (x, y, v) coordinates of the closest point on the path
+        """
+        closest_point = None
+        min_dist = float("inf")
+        for point in self.path:
+            dx = point[0] - x
+            dy = point[1] - y
+            dist = math.sqrt(dx**2 + dy**2)
+            if dist < min_dist:
+                min_dist = dist
+                closest_point = point
+        return closest_point
+
+    def smooth_vel(self, curr_vel, target_vel) -> float:
+        """
+        Apply velocity smoothing to prevent wheel skidding and abrupt changes.
+
+        Args:
+            curr_vel (float): Current vehicle velocity
+            target_vel (float): Desired target velocity
+
+        Returns:
+            float: Smoothed velocity command
+        """
+        if self.target_velocity != -1.0:
+            target_vel = min(target_vel, self.target_velocity)
+
+        vel = target_vel
+        if (target_vel - curr_vel) > self.skidding_velocity_thresh:
+            vel = self.skidding_velocity_thresh + curr_vel
+
+        return vel
+
+    def odom_callback(self, msg: Odometry):
+        """
+        Odometry callback to store the latest vehicle state.
+
+        Args:
+            msg (Odometry): Vehicle odometry containing pose and twist information
+        """
+        self.odometry = msg
+
+    def fused_odom_callback(self, msg: Odometry):
+        """
+        Fused odometry callback to store the latest fused vehicle state from state publisher.
+
+        Args:
+            msg (Odometry): Fused odometry containing map->base_link pose and velocity
+        """
+        self.fused_odometry = msg
+
+    def get_lad_thresh(self, v):
+        """
+        Calculate adaptive lookahead distance based on current velocity.
+
+        Uses linear interpolation between min/max lookahead distances based on
+        the velocity range. Higher velocities get larger lookahead distances.
+
+        Args:
+            v (float): Current vehicle velocity in m/s
+
+        Returns:
+            float: Calculated lookahead distance in meters
+        """
+        # Linear interpolation: lad = m*v + c
+        m = (self.max_lad - self.min_lad) / max(self.max_velocity - self.min_velocity, 1e-6)
+        c = self.max_lad - m * self.max_velocity
+        lad = m * v + c
+
+        # Clamp to bounds
+        lad = max(self.min_lad, min(self.max_lad, lad))
+        return lad
+
+    def get_lad_thresh_lateral_deviation(self, le):
+        """
+        Calculate adaptive lookahead distance based on lateral deviation.
+
+        Args:
+            le (float): Lateral deviation in meters
+
+        Returns:
+            float: Calculated lookahead distance in meters
+        """
+        # Simple proportional relationship (can be adjusted based on requirements)
+        if self.max_lateral_deviation <= 0.0:
+            return self.max_lad
+
+        lad = self.min_lad + abs(le) * (self.max_lad - self.min_lad) / self.max_lateral_deviation
+        return lad
+
+    def get_lad_lateral_deviation_velocity(self, v, le):
+        """
+        Calculate adaptive lookahead distance based on current velocity and lateral deviation.
+
+        Uses linear interpolation between min/max lookahead distances based on
+        the velocity range. Higher velocities get larger lookahead distances.
+
+        Args:
+            v (float): Current vehicle velocity in m/s
+            le (float): Lateral deviation in meters
+        Returns:
+            float: Calculated lookahead distance in meters
+        """
+        lad_v = self.get_lad_thresh(v)
+        lad_le = self.get_lad_thresh_lateral_deviation(le)
+        lad = (
+            self.lookahead_velocity_weight * lad_v
+            + self.lookahead_lateral_deviation_weight * lad_le
+        )
+        # Clamp to bounds
+        lad = max(self.min_lad, min(self.max_lad, lad))
+        return lad
+
+    def pursuit_the_point(
+        self, lookahead_distance, lookahead_point, lookahead_index, x, y, yaw, x_laser, y_laser, closest_point, closest_point_laser
+    ):
+        """
+        Execute pure pursuit control to track the lookahead point.
+
+        This is the core control algorithm that:
+        1. Transforms lookahead point to vehicle frame
+        2. Calculates curvature (gamma) for steering control
+        3. Applies PD control for steering angle
+        4. Determines appropriate velocity based on path curvature
+        5. Publishes Ackermann drive command
+
+        Args:
+            lookahead_point (tuple): (x, y, v) target point coordinates
+            lookahead_index (int): Index of lookahead point in path
+            x (float): Current vehicle x position
+            y (float): Current vehicle y position
+            yaw (float): Current vehicle yaw angle
+            closest_point (tuple): (x, y, v) closest point on path to vehicle
+        """
+        if not self.activate_autonomous_vel:
+            return
+        # Transform lookahead point to vehicle frame
+        lx, ly = self.transform_to_vehicle_frame(lookahead_point, x, y, yaw) # ly is the lateral deviation of the base_link frame from the lookahead point
+        laser_x_e, laser_y_e = self.transform_to_vehicle_frame(closest_point_laser, x_laser, y_laser, yaw) # laser_y_e is the lateral deviation of the laser frame from the closest point TO the laser frame on the racing line
+        base_x_e, base_y_e = self.transform_to_vehicle_frame(closest_point, x, y, yaw)# base_y_e is the lateral deviation of the base_link frame from the closest point TO the base_link frame on the racing line
+
+        # Check if perpendicular distance "ly" is too large (off-track detection)
+        # if ly >= lookahead_distance:
+        #     lookahead_index = (lookahead_index + 8) % len(self.path)  # Skip ahead in path
+        #     lookahead_point = self.path[lookahead_index]
+
+        # Calculate curvature (gamma) for pure pursuit steering
+        gamma = 2 * ly / (lookahead_distance**2)
+
+        # PD control for steering angle
+        d_controller = (gamma - self.prev_gamma) * self.kd
+        p_controller = self.kp * gamma
+        if self.use_lateral_error_gamma_compensation: # agressive compensation of steering angle based on lateral error
+            p_controller += ly * self.lateral_error_compensation_gain #! superduper line. 
+        self.prev_gamma = gamma
+        steering_angle = p_controller + d_controller
+
+        # Create Ackermann drive command
+        ackermann = AckermannDriveStamped()
+        ackermann.header.stamp = self.get_clock().now().to_msg()
+        ackermann.header.frame_id = "base_link"
+
+        if closest_point_laser[2] > 0.0:  # Path has velocity information
+            ackermann.drive.speed = closest_point_laser[2]
+            if self.use_lateral_error_speed_reducer: # safety feature to reduce speed when lateral error is large, preventing skidding and improving stability at high speeds
+                speed_reduction = abs(base_y_e) * self.lateral_error_speed_reducer_gain #! to be tested.
+                ackermann.drive.speed = max(
+                    self.min_velocity, ackermann.drive.speed - speed_reduction
+                )
+        else:  # Use sigmoid velocity control based on steering curvature
+            ackermann.drive.speed = (
+                self.find_linear_vel_steering_controlled_sigmoidally(gamma)
+            )
+
+        # Apply velocity smoothing to prevent skidding
+        ackermann.drive.speed = self.smooth_vel(
+            self.odometry.twist.twist.linear.x, ackermann.drive.speed
+        )
+        ackermann.drive.steering_angle = steering_angle
+
+        # Publish the control command
+        self.cmd_vel_pub.publish(ackermann)
+
+    def find_lookahead_point(self, lookahead_distance, x, y, yaw, x_laser, y_laser):
+        """
+        Find the appropriate lookahead point on the path for pure pursuit control.
+
+        This method:
+        1. Finds the closest point on the path to the vehicle
+        2. Searches forward from that point for a point at lookahead distance
+        3. Returns the lookahead point, closest point, and lookahead index
+
+        Args:
+            x (float): Current vehicle x position
+            y (float): Current vehicle y position
+
+        Returns:
+            tuple: (lookahead_point, closest_point, lookahead_index) or (None, None, None)
+                  if no suitable point is found
+        """
+        closest_idx = 0
+        closest_laser_idx = 0
+        min_dist = float("inf")
+        min_dist_laser = float("inf")
+
+        # Find the closest path point to the vehicle
+        for i, point in enumerate(self.path):
+            dx = point[0] - x
+            dy = point[1] - y
+            dist = math.sqrt(dx**2 + dy**2)
+            if dist < min_dist:
+                min_dist = dist
+                closest_idx = i
+            dx_laser = point[0] - x_laser
+            dy_laser = point[1] - y_laser
+            dist_laser = math.sqrt(dx_laser**2 + dy_laser**2)
+            if dist_laser < min_dist_laser:
+                min_dist_laser = dist_laser
+                closest_laser_idx = i
+
+        # Search forward from closest point for lookahead point
+        for i in range(closest_idx, len(self.path)):
+            dx = self.path[i][0] - x
+            dy = self.path[i][1] - y
+            distance = math.sqrt(dx**2 + dy**2)
+            if distance >= lookahead_distance:
+                return self.path[i], self.path[closest_idx], i, self.path[closest_laser_idx], closest_laser_idx
+
+        # If no point found, search from beginning (path wrap-around)
+        for i in range(0, len(self.path)):
+            dx = self.path[i][0] - x
+            dy = self.path[i][1] - y
+            distance = math.sqrt(dx**2 + dy**2)
+            if distance >= lookahead_distance:
+                return self.path[i], self.path[closest_idx], i, self.path[closest_laser_idx], closest_laser_idx
+
+        return None, None, None, None, None
+
+    def transform_to_vehicle_frame(self, point, x, y, yaw):
+        """
+        Transform a point from global frame to vehicle frame.
+
+        Args:
+            point (tuple): (x, y, v) point coordinates in global frame
+            x (float): Vehicle x position in global frame
+            y (float): Vehicle y position in global frame
+            yaw (float): Vehicle yaw angle
+
+        Returns:
+            tuple: (x, y) coordinates in vehicle frame
+        """
+        dx = point[0] - x
+        dy = point[1] - y
+        transformed_x = math.cos(-yaw) * dx - math.sin(-yaw) * dy
+        transformed_y = math.sin(-yaw) * dx + math.cos(-yaw) * dy
+        return transformed_x, transformed_y
+
+    def get_yaw_from_quaternion(self, q):
+        """
+        Extract yaw angle from quaternion orientation.
+
+        Args:
+            q: Quaternion object with w, x, y, z components
+
+        Returns:
+            float: Yaw angle in radians
+        """
+        siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
+        cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+        return math.atan2(siny_cosp, cosy_cosp)
+
+    def find_linear_vel_steering_controlled_rationally(self, gamma):
+        """
+        Calculate velocity using rational function based on steering curvature.
+
+        Args:
+            gamma (float): Curvature value for current steering
+
+        Returns:
+            float: Calculated velocity within min/max bounds
+        """
+        k = 7.0  # Steepness parameter
+        vel = self.min_velocity + (self.max_velocity - self.min_velocity) / (
+            1 + k * abs(gamma)
+        )
+        return max(self.min_velocity, min(self.max_velocity, vel))
+
+    def compute_c(self, v_min, v_max, k):
+        """
+        Compute the sigmoid offset parameter for velocity control.
+
+        Args:
+            v_min (float): Minimum velocity
+            v_max (float): Maximum velocity
+            k (float): Sigmoid steepness parameter
+
+        Returns:
+            float: Sigmoid offset parameter
+        """
+        return -1 * (1 / k) * np.log((v_max - v_max * 0.999) / (v_max * 0.999 - v_min))
+
+    def find_linear_vel_steering_controlled_sigmoidally(self, gamma):
+        """
+        Calculate velocity using sigmoid function based on steering curvature.
+
+        This provides smooth velocity transitions that slow down in tight corners
+        and speed up on straights, improving both safety and performance.
+
+        Args:
+            gamma (float): Curvature value for current steering
+
+        Returns:
+            float: Calculated velocity within min/max bounds
+        """
+        k = self.k_sigmoid
+        c = self.compute_c(v_min=self.min_velocity, v_max=self.max_velocity, k=k)
+        vel = self.min_velocity + (
+            (self.max_velocity - self.min_velocity) / (1 + np.exp(k * (abs(gamma) - c)))
+        )
+
+        # Clamp velocity to safety bounds
+        vel = max(self.min_velocity, min(self.max_velocity, vel))
+        return vel
+
+    def find_linear_vel_steering_controlled(self, gamma):
+        """
+        Calculate velocity using linear relationship with steering curvature.
+
+        Args:
+            gamma (float): Curvature value for current steering
+
+        Returns:
+            float: Calculated velocity within min/max bounds
+        """
+        # Linear relationship: vel = m*gamma + c
+        self.min_gamma = 0.0
+        self.max_gamma = 2 / self.lookahead_distance
+        m = (self.min_velocity - self.max_velocity) / (self.max_gamma - self.min_gamma)
+        c = self.min_velocity - m * self.max_gamma
+        vel = m * gamma + c
+
+        # Clamp to bounds
+        vel = max(self.min_velocity, min(self.max_velocity, vel))
+        return vel
+
+    def publish_lookahead_marker(self, point):
+        """
+        Publish a visual marker for the current lookahead point.
+
+        Args:
+            point (tuple): (x, y, v) coordinates of the lookahead point
+        """
+        marker = Marker()
+        marker.header.frame_id = "map"
+        marker.header.stamp = self.get_clock().now().to_msg()
+        marker.ns = "lookahead"
+        marker.id = 0
+        marker.type = Marker.SPHERE
+        marker.action = Marker.ADD
+        marker.pose.position.x = point[0]
+        marker.pose.position.y = point[1]
+        marker.pose.position.z = 0.1  # Slightly above ground
+        marker.pose.orientation.w = 1.0
+        marker.scale.x = 0.3
+        marker.scale.y = 0.3
+        marker.scale.z = 0.3
+        marker.color.a = 1.0  # Fully opaque
+        marker.color.r = 1.0  # Red
+        marker.color.g = 0.0
+        marker.color.b = 0.0
+        self.lookahead_marker_pub.publish(marker)
+
+    def publish_lookahead_circle(self, x, y):
+        """
+        Publish a visual circle marker showing the current lookahead distance.
+
+        Args:
+            x (float): Vehicle x position (center of circle)
+            y (float): Vehicle y position (center of circle)
+        """
+        marker = Marker()
+        marker.header.frame_id = "map"
+        marker.header.stamp = self.get_clock().now().to_msg()
+        marker.ns = "lookahead"
+        marker.id = 1
+        marker.type = Marker.LINE_STRIP
+        marker.action = Marker.ADD
+        marker.pose.orientation.w = 1.0
+        marker.scale.x = 0.03  # Line thickness
+        marker.color.a = 1.0  # Fully opaque
+        marker.color.r = 0.0
+        marker.color.g = 1.0  # Green
+        marker.color.b = 0.0
+
+        # Create circle points around vehicle position
+        for i in range(self.marker_resolution + 1):
+            angle = 2 * math.pi * i / self.marker_resolution
+            px = x + self.lookahead_distance * math.cos(angle)
+            py = y + self.lookahead_distance * math.sin(angle)
+            p = Point()
+            p.x = px
+            p.y = py
+            p.z = 0.05
+            marker.points.append(p)
+
+        self.lookahead_circle_pub.publish(marker)
+
+
+def main(args=None):
+    """
+    Main function to initialize and run the Pure Pursuit node.
+
+    Args:
+        args: Command line arguments (optional)
+    """
+    rclpy.init(args=args)
+    node = PurePursuit()
+
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        node.get_logger().info("Pure Pursuit node shutting down...")
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()

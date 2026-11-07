@@ -1,0 +1,45 @@
+pure_pursuit_node:
+  ros__parameters:
+    use_fused_odometry: false
+    # Lookahead Distance Parameters
+    max_lookahead_distance: 1.0      # Maximum lookahead distance in meters
+    min_lookahead_distance: 0.35     # Minimum lookahead distance in meters
+    
+    # Velocity Control Parameters
+    vel_division_factor: 2.0          # Factor to reduce velocity commands
+    skidding_velocity_thresh: 0.3     # Velocity threshold to prevent skidding
+    
+    # Control Parameters
+    kp: 0.45                          # Proportional gain for steering control
+    kd: 1.2                           # Derivative gain for steering control
+    k_sigmoid: 8.0                    # Sigmoid steepness for velocity control
+    use_lateral_error_gamma_compensation: true  # Enable compensation of steering angle based on lateral error
+    lateral_error_compensation_gain: 0.4  # Gain for lateral error compensation
+    use_lateral_error_speed_reducer: true  # Enable speed reduction based on lateral error
+    lateral_error_speed_reducer_gain: 2.0  # Gain for speed reduction based on lateral error
+    lookahead_velocity_weight: 0.5     # Weight for velocity-based lookahead distance
+    lookahead_lateral_deviation_weight: 0.5  # Weight for lateral-error-based lookahead distance
+    max_lateral_deviation: 1.0         # Lateral deviation that maps to maximum lookahead distance
+
+    # Topic Names
+    cmd_vel_topic: "/pure_pursuit/ackermann_cmd"   # Ackermann drive command topic
+    odometry_topic: "/odom"           # Odometry topic for vehicle pose
+    joy_topic: "/joy"                     # Joystick topic for manual tuning
+    pause_topic: "/control_selector"                 # Control selector topic to pause/resume autonomous control
+    path_topic: "/pp_path"                   # Topic for the selected path
+    tf_target: "map"
+    tf_source: "base_link"
+    laser_base_link_length: 0.124
+
+    # Timer and Processing Parameters
+    control_frequency: 200.0              # Control loop frequency in Hz (1/timer_period)
+    tf_timeout: 0.5                       # Transform lookup timeout in seconds
+    marker_resolution: 60                 # Circle marker resolution for visualization
+    
+    # Queue Sizes
+    subscriber_queue_size: 10         # ROS subscriber queue size
+    publisher_queue_size: 10          # ROS publisher queue size
+
+    # Speed capping 
+    enable_speed_capping: true         # Enable or disable speed capping
+    speed_capping_topic: "/speed_capping"  # Topic to receive speed capping commands
